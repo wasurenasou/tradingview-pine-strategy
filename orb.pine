@@ -1,0 +1,400 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © mike-neko22
+
+//@version=6
+strategy("JP ORB AM Long + VWAP offset + breakExtra + DIAG v6 (anti-lookahead) [refactored]",
+     overlay=true,
+     pyramiding=0,
+     process_orders_on_close=true,
+     calc_on_order_fills=false)
+
+//==================================================
+// Functions (計算だけを関数化：副作用はメインに残す)
+//==================================================
+
+// 出来高フィルタ（毎バーSMAを計算するので警告が出にくい）
+f_volOk(_use, _len, _mult) =>
+    _sma = ta.sma(volume, _len)
+    not _use or (volume > _sma * _mult)
+
+// VWAP値とVWAPフィルタ（戻り値：vwap, ok）
+f_vwapAndOk(_use, _offsetTicks, _tick) =>
+    _v = ta.vwap(hlc3)
+    _ok = (not _use) or (close > _v + _offsetTicks * _tick)
+    [_v, _ok]
+
+// 利確/損切価格を計算（R/Percent両対応）
+f_targets(_mode, _entry, _stopAnchor, _r, _tp1R, _tp2R, _stopPct, _t1Pct, _t2Pct) =>
+    float stopP = na
+    float tp1   = na
+    float tp2   = na
+
+    if _mode == "R"
+        if _r > 0
+            stopP := _stopAnchor
+            tp1   := _entry + _r * _tp1R
+            tp2   := _entry + _r * _tp2R
+    else
+        stopP := _entry * (1 - _stopPct / 100)
+        tp1   := _entry * (1 + _t1Pct  / 100)
+        tp2   := _entry * (1 + _t2Pct  / 100)
+
+    [stopP, tp1, tp2]
+
+//==================================================
+// Inputs
+//==================================================
+orbMinutes      = input.int(15, "ORB時間(分)", minval=1, maxval=60)
+entryDelayMin   = input.int(0,  "ORB終了後の待ち(分)", minval=0, maxval=10)
+
+endHour         = input.int(11, "取引終了 時", minval=9, maxval=15)
+endMinute       = input.int(0,  "取引終了 分", minval=0, maxval=59)
+
+maxTradesPerDay = input.int(2, "1日の最大トレード数", minval=1, maxval=10)
+maxConsecLosses = input.int(2, "当日 連敗で停止", minval=1, maxval=10)
+
+useVolFilter    = input.bool(false, "出来高フィルタを使う")
+volLen          = input.int(20, "出来高SMA期間", minval=1, maxval=200)
+volMult         = input.float(1.5, "出来高倍率", minval=0.1, step=0.1)
+
+useVWAPFilter   = input.bool(true, "VWAPフィルタを使う")
+vwapOffsetTicks = input.int(5, "VWAP上オフセット(ティック)", minval=0, maxval=50)
+
+breakExtraTicks = input.int(0, "ブレイク余裕(ティック)", minval=0, maxval=50)
+
+exitMode        = input.string("R", "利確/損切モード", options=["R","Percent"])
+tp1R            = input.float(1.0, "利確1: R倍", minval=0.1, step=0.1)
+tp2R            = input.float(2.0, "利確2: R倍", minval=0.1, step=0.1)
+take1QtyPct     = input.float(50.0, "利確1の割合(%)", minval=1, maxval=99)
+
+stopBufferTicks = input.int(1, "損切りバッファ(ティック)", minval=0, maxval=20)
+
+stopPct         = input.float(0.2, "損切%（Percentモード）", minval=0.01, step=0.01)
+take1Pct        = input.float(0.2, "利確1%（Percentモード）", minval=0.01, step=0.01)
+take2Pct        = input.float(0.4, "利確2%（Percentモード）", minval=0.01, step=0.01)
+
+showDiag        = input.bool(true, "診断Δを表示")
+
+useLossCut    = input.bool(true, "含み損なら早めにクローズ（LossCutTS）")
+lossCutHour   = input.int(14, "LossCut 時", minval=9, maxval=15)
+lossCutMinute = input.int(30, "LossCut 分", minval=0, maxval=59)
+lossCutMinLossR = input.float(0.0, "LossCut閾値（損失R）", minval=0.0, step=0.05)
+lossCutUseVwapGate   = input.bool(true,  "LossCut条件にVWAPゲートを使う（VWAP下だけ切る）")
+lossCutVwapOffTicks  = input.int(0, "LossCut VWAPオフセット(ティック)", minval=0, maxval=50)
+
+useOrbRangeFilter = input.bool(true, "ORB幅フィルタを使う")
+orbMinTicks       = input.int(10, "ORB最小幅(ティック)", minval=1, maxval=10000)
+orbMaxTicks       = input.int(200, "ORB最大幅(ティック)", minval=1, maxval=10000)
+lossCutUseBreakGate = input.bool(true, "LossCut条件にBreak再割れゲートを使う")
+
+//====================
+// Backtest Date Filter（←ここが今回の修正ポイント）
+// 既存の startTS/endTS/inWindow と衝突しないよう別名にする
+//====================
+useDateFilter = input.bool(true, "バックテスト期間を指定")
+
+btStartY = input.int(2025, "開始 年")
+btStartM = input.int(10,   "開始 月", minval=1, maxval=12)
+btStartD = input.int(14,   "開始 日", minval=1, maxval=31)
+
+btEndY   = input.int(2026, "終了 年")
+btEndM   = input.int(2,    "終了 月", minval=1, maxval=12)
+btEndD   = input.int(6,    "終了 日", minval=1, maxval=31)
+
+btStartTS = timestamp("Asia/Tokyo", btStartY, btStartM, btStartD, 0, 0)
+btEndTS   = timestamp("Asia/Tokyo", btEndY,   btEndM,   btEndD,   23, 59)
+
+inDateRange = not useDateFilter or (time >= btStartTS and time <= btEndTS)
+
+// 期間外に跨いだポジションは強制クローズ（重複していたので1回だけに統一）
+if useDateFilter and not inDateRange and strategy.position_size != 0
+    strategy.close_all(comment="OutOfDateRange")
+
+//==================================================
+// Day/session time（←これは日中セッション用。ここはそのまま）
+//==================================================
+tick = syminfo.mintick
+isNewDay = timeframe.change("D")
+
+y = year(time), m = month(time), d = dayofmonth(time)
+openTS    = timestamp(syminfo.timezone, y, m, d, 9, 0)
+orbEndTS  = openTS + orbMinutes * 60 * 1000
+startTS   = orbEndTS + entryDelayMin * 60 * 1000
+endTS     = timestamp(syminfo.timezone, y, m, d, endHour, endMinute)
+lossCutTS = timestamp(syminfo.timezone, y, m, d, lossCutHour, lossCutMinute)
+breakGateActive = time < lossCutTS
+
+inOrb    = time >= openTS and time < orbEndTS
+afterOrb = time >= orbEndTS
+inWindow = time >= startTS and time < endTS
+
+//==================================================
+// ORB High/Low
+//==================================================
+var float orbHigh  = na
+var float orbLow   = na
+var bool  orbReady = false
+
+// Daily counters
+var int tradesToday     = 0
+var int consecLosses    = 0
+var int lastClosedCount = 0
+
+// anti-lookahead (同一バーでExitを出さない)
+var int  L_entryBar = na
+var bool L_tp1Done  = false
+
+if isNewDay
+    orbHigh := na
+    orbLow := na
+    orbReady := false
+    tradesToday := 0
+    consecLosses := 0
+    lastClosedCount := strategy.closedtrades
+    L_entryBar := na
+
+if inOrb
+    orbHigh := na(orbHigh) ? high : math.max(orbHigh, high)
+    orbLow  := na(orbLow)  ? low  : math.min(orbLow, low)
+
+if afterOrb and not orbReady and not na(orbHigh) and not na(orbLow)
+    orbReady := true
+
+//==================================================
+// Daily trend filter (Regime Gate)
+// close(D) > sma20(D) AND sma20(D) > sma50(D)
+//==================================================
+useDailyTrendGate = input.bool(true, "日足トレンドゲート（D: close>SMA20 & SMA20>SMA50）を使う")
+
+// 日足の終値とSMA（先読み防止のため lookahead_off）
+dClose = request.security(syminfo.tickerid, "D", close, barmerge.gaps_off, barmerge.lookahead_off)
+dSma20 = request.security(syminfo.tickerid, "D", ta.sma(close, 20), barmerge.gaps_off, barmerge.lookahead_off)
+dSma50 = request.security(syminfo.tickerid, "D", ta.sma(close, 50), barmerge.gaps_off, barmerge.lookahead_off)
+
+dailyTrendOk = (dClose > dSma20) and (dSma20 > dSma50)
+trendOk = (not useDailyTrendGate) or dailyTrendOk
+
+//==================================================
+// Filters
+//==================================================
+volOk = f_volOk(useVolFilter, volLen, volMult)
+[vwap, vwapOk] = f_vwapAndOk(useVWAPFilter, vwapOffsetTicks, tick)
+
+// LossCut用のVWAPゲート（VWAPの下なら弱い）
+lossCutVwapLevel = vwap - lossCutVwapOffTicks * tick
+weakByVWAP       = close < lossCutVwapLevel
+orbRange      = orbHigh - orbLow
+orbRangeTicks = orbReady ? (orbRange / tick) : na
+rangeOk       = (not useOrbRangeFilter) or (orbReady and orbRangeTicks >= orbMinTicks and orbRangeTicks <= orbMaxTicks)
+
+// Break level (entry threshold)
+breakLevel = orbHigh + breakExtraTicks * tick
+
+// Break再割れゲート（Break水準を終値で割ったら弱い）
+weakByBreak = close < breakLevel
+
+//==================================================
+// Trade permission
+//==================================================
+noPos = strategy.position_size == 0
+canTradeToday = (tradesToday < maxTradesPerDay) and (consecLosses < maxConsecLosses)
+
+//==================================================
+// Entry condition (close-based breakout)
+//==================================================
+breakoutLong =
+     orbReady and inWindow and inDateRange and rangeOk and volOk and vwapOk and trendOk and canTradeToday and noPos and
+     (close > breakLevel) and (close[1] <= breakLevel)
+
+     
+alertcondition(
+    breakoutLong,
+    title = "ORB Breakout Long (Close)",
+    message = "7203 | 5m close > BreakLevel | {{time}}"
+)
+
+//==================================================
+// Enter (market)
+//==================================================
+if breakoutLong
+    alert("7203 | ORB Breakout (5m close) | " + syminfo.ticker + " | " + str.tostring(time, "yyyy-MM-dd HH:mm"), alert.freq_once_per_bar_close)
+    strategy.entry("L", strategy.long)
+    tradesToday += 1
+    L_entryBar := bar_index
+    L_tp1Done  := false
+
+//==================================================
+// Exit logic (Long)
+//==================================================
+var float L_entry = na
+var float L_stopA = na   // stop anchor（ORB low - buffer）
+var float L_r     = na
+
+if strategy.position_size > 0 and na(L_entry)
+    L_entry := strategy.position_avg_price
+    L_stopA := orbLow - stopBufferTicks * tick
+    L_r     := L_entry - L_stopA
+
+if strategy.position_size <= 0
+    L_entry := na
+    L_stopA := na
+    L_r     := na
+    L_entryBar := na
+    // L_tp1Done := false   // ← ここは消す（TS判定が崩れやすい）
+
+canPlaceExits = strategy.position_size > 0 and (na(L_entryBar) ? true : bar_index > L_entryBar)
+
+if canPlaceExits and strategy.position_size > 0 and not na(L_entry)
+    [stopPrice, tp1, tp2] = f_targets(exitMode, L_entry, L_stopA, L_r, tp1R, tp2R, stopPct, take1Pct, take2Pct)
+
+    // TP1到達判定（バー内順序依存を減らす）
+    if not L_tp1Done and not na(tp1) and high >= tp1
+        L_tp1Done := true
+
+    stopAfterTp1 = L_tp1Done ? L_entry : stopPrice
+
+    if not na(stopPrice) and not na(tp1) and not na(tp2)
+        // TP1：部分利確（固定ストップ）
+        strategy.exit("L-TP1", from_entry="L", qty_percent=take1QtyPct, limit=tp1, stop=stopPrice)
+        // TP2：残り（TP1後は建値ストップへ切替）
+        strategy.exit("L-TP2", from_entry="L", qty_percent=(100 - take1QtyPct), limit=tp2, stop=stopAfterTp1)
+
+// LossCutTS：指定時刻を過ぎたら「-X R以上の含み損」だけクローズ（微マイナスは切らない）
+// ※TP1後は建値ストップへ寄せたいので、LossCutは「TP1前のみ」に限定
+lossCutPrice = (strategy.position_size > 0 and not na(L_entry) and not na(L_r) and L_r > 0) ? (L_entry - L_r * lossCutMinLossR) : na
+
+// LossCut
+doLossCut =
+     useLossCut and
+     strategy.position_size > 0 and
+     not L_tp1Done and
+     not na(lossCutPrice) and
+     close <= lossCutPrice and
+     time >= lossCutTS and time < endTS and
+     (na(L_entryBar) ? true : bar_index > L_entryBar) and
+     (not lossCutUseBreakGate or not breakGateActive or weakByBreak)
+
+
+if doLossCut
+    strategy.close("L", comment="LossCutTS")
+
+// Time stop（15:25など “バーの終値” で揃えるため time_close を使う）
+if time_close >= endTS and strategy.position_size != 0
+    strategy.close_all(comment="TimeStop")
+
+//-------------------------
+// Update consecutive losses + Exit reason counters
+//-------------------------
+var int nTP1 = 0
+var int nTP2 = 0
+var int nSL  = 0
+var int nTS  = 0
+var int nLC  = 0
+
+var int nTS_befTP1 = 0
+var int nTS_aftTP1 = 0
+
+var int nTS_win  = 0
+var int nTS_loss = 0
+var int nTS_flat = 0
+
+var string lastExitId  = ""
+var string lastExitCmt = ""
+var float  lastPnL     = na
+
+if strategy.closedtrades > lastClosedCount
+    int idx      = strategy.closedtrades - 1
+    float profit = strategy.closedtrades.profit(idx)
+    string eId   = strategy.closedtrades.exit_id(idx)
+    string eCmt  = strategy.closedtrades.exit_comment(idx)
+
+    // 連敗カウント（従来どおり）
+    consecLosses := profit < 0 ? consecLosses + 1 : 0
+
+    bool isLC = (eCmt == "LossCutTS")
+    bool isTS = (eCmt == "TimeStop")
+    bool isSL = (not isTS) and (not isLC) and (profit < 0)
+
+    if isLC
+        nLC += 1
+    else if isTS
+        nTS += 1
+
+        // TS勝ち負け
+        if profit > 0
+            nTS_win += 1
+        else if profit < 0
+            nTS_loss += 1
+        else
+            nTS_flat += 1
+
+        // TSがTP1の前か後か（L_tp1Doneで判定）
+        if L_tp1Done
+            nTS_aftTP1 += 1
+        else
+            nTS_befTP1 += 1
+
+    else if isSL
+        nSL += 1
+    else if eId == "L-TP1"
+        nTP1 += 1
+    else if eId == "L-TP2"
+        nTP2 += 1
+    else
+        // どれにも当たらない場合はTS扱い（保険）
+        nTS += 1
+
+    lastClosedCount := strategy.closedtrades
+    lastExitId  := eId
+    lastExitCmt := eCmt
+    lastPnL     := profit
+
+//-------------------------
+// HUD (table)
+//-------------------------
+var table hud = table.new(position.top_right, 2, 11)
+
+if barstate.islast
+    table.clear(hud, 0, 0, 1, 10)
+
+    if showDiag
+        table.cell(hud, 0, 0, "EXIT COUNT")
+        table.cell(hud, 1, 0, "")
+
+        table.cell(hud, 0, 1, "TP1")
+        table.cell(hud, 1, 1, str.tostring(nTP1))
+
+        table.cell(hud, 0, 2, "TP2")
+        table.cell(hud, 1, 2, str.tostring(nTP2))
+
+        table.cell(hud, 0, 3, "SL")
+        table.cell(hud, 1, 3, str.tostring(nSL))
+
+        table.cell(hud, 0, 4, "LC")
+        table.cell(hud, 1, 4, str.tostring(nLC))
+
+        table.cell(hud, 0, 5, "TS")
+        table.cell(hud, 1, 5, str.tostring(nTS))
+
+        table.cell(hud, 0, 6, "TS< TP1")
+        table.cell(hud, 1, 6, str.tostring(nTS_befTP1))
+
+        table.cell(hud, 0, 7, "TS>=TP1")
+        table.cell(hud, 1, 7, str.tostring(nTS_aftTP1))
+
+        table.cell(hud, 0, 8, "TS win")
+        table.cell(hud, 1, 8, str.tostring(nTS_win))
+
+        table.cell(hud, 0, 9, "TS loss")
+        table.cell(hud, 1, 9, str.tostring(nTS_loss))
+
+        table.cell(hud, 0, 10, "last")
+        table.cell(hud, 1, 10, lastExitId + " / " + lastExitCmt + " / " + str.tostring(lastPnL))
+
+//==================================================
+// Plots
+//==================================================
+plot(orbReady ? orbHigh : na, "ORB High", linewidth=2)
+plot(orbReady ? orbLow  : na, "ORB Low",  linewidth=2)
+plot(vwap, "VWAP", linewidth=1)
+plot(orbReady ? breakLevel : na, "Break Level", linewidth=1)
