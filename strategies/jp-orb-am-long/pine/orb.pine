@@ -47,8 +47,8 @@ f_targets(_mode, _entry, _stopAnchor, _r, _tp1R, _tp2R, _stopPct, _t1Pct, _t2Pct
 orbMinutes      = input.int(15, "ORB時間(分)", minval=1, maxval=60)
 entryDelayMin   = input.int(0,  "ORB終了後の待ち(分)", minval=0, maxval=10)
 
-endHour         = input.int(11, "取引終了 時", minval=9, maxval=15)
-endMinute       = input.int(0,  "取引終了 分", minval=0, maxval=59)
+endHour         = input.int(14, "取引終了 時", minval=9, maxval=15)
+endMinute       = input.int(45,  "取引終了 分", minval=0, maxval=59)
 
 maxTradesPerDay = input.int(2, "1日の最大トレード数", minval=1, maxval=10)
 maxConsecLosses = input.int(2, "当日 連敗で停止", minval=1, maxval=10)
@@ -79,13 +79,13 @@ useLossCut    = input.bool(true, "含み損なら早めにクローズ（LossCut
 lossCutHour   = input.int(14, "LossCut 時", minval=9, maxval=15)
 lossCutMinute = input.int(30, "LossCut 分", minval=0, maxval=59)
 lossCutMinLossR = input.float(0.0, "LossCut閾値（損失R）", minval=0.0, step=0.05)
-lossCutUseVwapGate   = input.bool(true,  "LossCut条件にVWAPゲートを使う（VWAP下だけ切る）")
+lossCutUseVwapGate   = input.bool(false,  "LossCut条件にVWAPゲートを使う（VWAP下だけ切る）")
 lossCutVwapOffTicks  = input.int(0, "LossCut VWAPオフセット(ティック)", minval=0, maxval=50)
 
-useOrbRangeFilter = input.bool(true, "ORB幅フィルタを使う")
+useOrbRangeFilter = input.bool(false, "ORB幅フィルタを使う")
 orbMinTicks       = input.int(10, "ORB最小幅(ティック)", minval=1, maxval=10000)
 orbMaxTicks       = input.int(200, "ORB最大幅(ティック)", minval=1, maxval=10000)
-lossCutUseBreakGate = input.bool(true, "LossCut条件にBreak再割れゲートを使う")
+lossCutUseBreakGate = input.bool(false, "LossCut条件にBreak再割れゲートを使う")
 
 //====================
 // Backtest Date Filter（←ここが今回の修正ポイント）
@@ -164,7 +164,7 @@ if afterOrb and not orbReady and not na(orbHigh) and not na(orbLow)
 // Daily trend filter (Regime Gate)
 // close(D) > sma20(D) AND sma20(D) > sma50(D)
 //==================================================
-useDailyTrendGate = input.bool(true, "日足トレンドゲート（D: close>SMA20 & SMA20>SMA50）を使う")
+useDailyTrendGate = input.bool(false, "日足トレンドゲート（D: close>SMA20 & SMA20>SMA50）を使う")
 
 // 日足の終値とSMA（先読み防止のため lookahead_off）
 dClose = request.security(syminfo.tickerid, "D", close, barmerge.gaps_off, barmerge.lookahead_off)
@@ -206,9 +206,11 @@ breakoutLong =
      orbReady and inWindow and inDateRange and rangeOk and volOk and vwapOk and trendOk and canTradeToday and noPos and
      (close > breakLevel) and (close[1] <= breakLevel)
 
+// Alert condition (confirmed bar only, separated from strategy entry)
+alertBreakoutLong = barstate.isconfirmed and breakoutLong
      
 alertcondition(
-    breakoutLong,
+    alertBreakoutLong,
     title = "ORB Breakout Long (Close)",
     message = "7203 | 5m close > BreakLevel | {{time}}"
 )
